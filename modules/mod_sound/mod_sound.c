@@ -33,12 +33,68 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "bgddl.h"
 
 #include <SDL.h>
 
 #include "SDL_mixer.h"
+#include "hwaudio.h"
+
+/* SF3500: matches C-Dogs' own proven architecture exactly (src/cdogs/
+ * sf3500/sf3500_bridge.c, Sf3500AudioPostMix) instead of a custom SDL2
+ * audio driver - confirmed on real hardware that a custom driver
+ * (intercepting at SDL2's own OpenDevice/PlayDevice level) exposed a
+ * zero-channel SDL_AudioStream bug that stalled the ENTIRE process, not
+ * just audio - every other port on this device (TinySTG, C-Dogs, Doom,
+ * HCL) avoids SDL2's own device/resampling machinery entirely by either
+ * writing straight to hwaudio_write() or, when a third-party mixer sits
+ * in between (SDL_mixer here, same as C-Dogs), tapping the ALREADY-
+ * MIXED buffer via Mix_SetPostMix() instead. See sorr_handoff project
+ * memory. */
+static void SF3500_AudioPostMix( void * udata, Uint8 * stream, int len )
+{
+    (void) udata;
+    /* Opened at exactly HWAUDIO_RATE/stereo/S16 below - no resampling
+     * needed, same as C-Dogs' own comment on this exact line. */
+    hwaudio_write( (const short *) stream, len / 4 );
+
+    /* SF3500: real-time-producer diagnostic - buffer-size tuning in both
+     * directions made the reported crackle/stutter WORSE, not better
+     * (see sorr_handoff project memory), which points at the PRODUCER
+     * (SDL's generic audio thread: SDL_Delay() + SDL_mixer's own internal
+     * channel-mixing work, all upstream of this tap) intermittently
+     * running slower than real time rather than a buffer-size mismatch.
+     * This measures the actual wall-clock gap between successive calls
+     * to this tap - if that gap regularly exceeds the nominal buffer
+     * duration (~46ms at the current audio_buffers formula), that is
+     * direct, conclusive proof of a CPU-bound producer stall instead of
+     * more indirect reasoning. Printed once/sec, same throttling pattern
+     * as libsdlhandler.c's existing hook. */
+    {
+        static struct timespec last = { 0, 0 };
+        static long max_interval_ms = 0;
+        static unsigned calls = 0;
+        static time_t last_sec = 0;
+        struct timespec now;
+        clock_gettime( CLOCK_MONOTONIC, &now );
+        if ( last.tv_sec || last.tv_nsec ) {
+            long interval_ms = ( now.tv_sec - last.tv_sec ) * 1000
+                              + ( now.tv_nsec - last.tv_nsec ) / 1000000;
+            if ( interval_ms > max_interval_ms ) max_interval_ms = interval_ms;
+        }
+        last = now;
+        calls++;
+        if ( now.tv_sec != last_sec ) {
+            fprintf( stderr, "SF3500: postmix calls=%u max_interval_ms=%ld len=%d (nominal~46ms)\n",
+                     calls, max_interval_ms, len );
+            calls = 0;
+            max_interval_ms = 0;
+            last_sec = now.tv_sec;
+        }
+    }
+}
 
 #include "files.h"
 #include "xstrings.h"
@@ -125,8 +181,23 @@ static int SDLCALL __modsound_close_cb( SDL_RWops *context )
     return( 0 );
 }
 
+static Sint64 SDLCALL __modsound_size_cb( SDL_RWops *context )
+{
+    return ( Sint64 ) file_size( context->hidden.unknown.data1 );
+}
+
 static SDL_RWops *SDL_RWFromBGDFP( file *fp )
 {
+    /* SF3500: SDL_AllocRW() does not zero the struct, and this never set
+     * rwops->size - every other field here was being filled in. WAV
+     * loading (Mix_LoadWAV_RW) never calls SDL_RWsize() so that gap was
+     * invisible for every .wav load that succeeded; OGG loading
+     * (stb_vorbis_open_rwops) calls SDL_RWsize() unconditionally to get
+     * the stream length up front, jumping through the leftover garbage
+     * in that pointer slot - this was the real cause of the "jump to
+     * garbage in libc data" SIGILL, not the mod_m7 table (checked and
+     * ruled out: symbol_list[] and symbol_list_runtime[] are byte-for-
+     * byte aligned, 55/55 entries). See sorr_handoff project memory. */
     SDL_RWops *rwops = SDL_AllocRW();
     if ( rwops != NULL )
     {
@@ -134,6 +205,7 @@ static SDL_RWops *SDL_RWFromBGDFP( file *fp )
         rwops->read = __modsound_read_cb;
         rwops->write = __modsound_write_cb;
         rwops->close = __modsound_close_cb;
+        rwops->size = __modsound_size_cb;
         rwops->hidden.unknown.data1 = fp;
     }
     return( rwops );
@@ -167,14 +239,13 @@ static int sound_init()
     {
         /* Initialize variables: but limit quality to some fixed options */
 
-        audio_rate = GLODWORD( mod_sound, SOUND_FREQ );
-
-        if ( audio_rate > 22050 )
-            audio_rate = 44100;
-        else if ( audio_rate > 11025 )
-            audio_rate = 22050;
-        else
-            audio_rate = 11025;
+        /* SF3500: pin to the hardware's fixed native rate instead of the
+         * upstream 11025/22050/44100 cascade - matches C-Dogs' own
+         * OpenAudio() call exactly, so SDL_mixer's internal mixing never
+         * needs cross-rate conversion against what hwaudio_write()
+         * expects. The script's own SOUND_FREQ preference is no longer
+         * read - this device only has the one real rate anyway. */
+        audio_rate = HWAUDIO_RATE;
 
 #ifdef TARGET_WII
         /* WII uses a powerpc architecture, which is big-endian */
@@ -187,16 +258,38 @@ static int sound_init()
 #ifdef TARGET_WII
         audio_buffers = 1024;
 #else
+        /* SF3500: tried both directions away from this legacy formula's
+         * ~2229-frame/46ms result on real hardware - HWAUDIO_CHUNK*2 (960,
+         * ~20ms, "hiccups on a treadmill") and 8192 (~170ms, "slow
+         * motion stutter") - both confirmed WORSE than the original value,
+         * not better. hwaudio_get_stats() showed dropped=0 throughout
+         * every variant (the ring never overflows), so the periodic
+         * crackle isn't a buffer-size tuning problem at all; whatever is
+         * actually causing it survives unchanged across this entire
+         * range. Reverted to the original formula - do not re-tune this
+         * value without new evidence pointing at it specifically. See
+         * sorr_handoff project memory. */
         audio_buffers = 1024 * audio_rate / 22050;
 #endif
 
         /* Open the audio device */
         if ( Mix_OpenAudio( audio_rate, audio_format, audio_channels, audio_buffers ) >= 0 )
         {
+            hwaudio_init();
+            Mix_SetPostMix( SF3500_AudioPostMix, NULL );
             GLODWORD( mod_sound, SOUND_CHANNELS ) <= 32 ? Mix_AllocateChannels( GLODWORD( mod_sound, SOUND_CHANNELS ) ) : Mix_AllocateChannels( 32 ) ;
             Mix_QuerySpec( &audio_rate, &audio_format, &audio_channels );
             audio_mix_channels = Mix_AllocateChannels( -1 ) ;
             GLODWORD( mod_sound, SOUND_CHANNELS ) = audio_mix_channels ;
+
+            /* SF3500: one-time spec dump - SF3500_AudioPostMix() hardcodes
+             * len/4 (S16 stereo = 4 bytes/frame); if the real negotiated
+             * spec differs (mono, or a format other than S16), that math
+             * silently breaks instead of erroring. Checking this directly
+             * instead of assuming it, per the still-open underrun/stutter
+             * investigation. See sorr_handoff project memory. */
+            fprintf( stderr, "SF3500: audio spec rate=%d format=0x%x channels=%d mix_channels=%d\n",
+                     audio_rate, audio_format, audio_channels, audio_mix_channels );
 
             audio_initialized = 1;
             return 0;

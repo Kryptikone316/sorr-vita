@@ -1,24 +1,12 @@
-cmake_minimum_required(VERSION 3.4)
-
-if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
-  if(DEFINED ENV{VITASDK})
-    set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "toolchain file")
-  else()
-    message(FATAL_ERROR "Please define VITASDK to point to your SDK path!")
-  endif()
-endif()
-
-include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
+# SF3500 MIPS build (not the Vita build this repo was written for - see
+# sorr_handoff project memory). CMAKE_TOOLCHAIN_FILE is passed on the
+# command line (shared sf3500-toolchain.cmake), not resolved here.
+cmake_minimum_required(VERSION 3.10)
 
 project(sorr C)
 
-add_definitions("-Dmemcpy=sceClibMemcpy")
-add_definitions("-Dmemcmp=sceClibMemcmp")
-add_definitions("-Dstrcmp=sceClibStrcmp")
-add_definitions("-Dstrncmp=sceClibStrncmp")
-add_definitions("-Dstrncpy=sceClibStrncpy")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Ofast")
-add_definitions("-ffast-math -ftree-vectorize -mfpu=neon")
+add_definitions("-ffast-math -ftree-vectorize")
 
 # Require tre
 add_subdirectory(3rdparty/tre)
@@ -28,8 +16,12 @@ find_package(SDL2 2.0.4 REQUIRED)
 find_package(SDL2_mixer REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(PNG REQUIRED)
-find_package(OGG REQUIRED)
-find_package(Vorbis REQUIRED)
+# OGG/Vorbis dropped: confirmed by grepping the actual compiled source
+# (BGDRTM_SOURCE_FILES below) that nothing calls ov_*/vorbis_*/ogg_* -
+# mod_theora (the only module that does) isn't in that list, so the
+# upstream Vita link line's ogg/vorbis/opus/FLAC/modplug/xmp/mikmod/
+# mpg123 entries are all dead weight for this build, not real
+# dependencies - see sorr_handoff project memory.
 
 # Preprocessor macros
 include(common_defs)
@@ -112,7 +104,10 @@ set(BGDRTM_SOURCE_FILES
   ${CMAKE_SOURCE_DIR}/modules/libwm/libwm.c
   ${CMAKE_SOURCE_DIR}/modules/mod_wm/mod_wm.c
   ${CMAKE_SOURCE_DIR}/modules/mod_sys/mod_sys.c
-  ${CMAKE_SOURCE_DIR}/modules/mod_flic/mod_flic.c)
+  ${CMAKE_SOURCE_DIR}/modules/mod_flic/mod_flic.c
+  ${CMAKE_SOURCE_DIR}/src/sf3500/hwdisp.c
+  ${CMAKE_SOURCE_DIR}/src/sf3500/joykey.c
+  ${CMAKE_SOURCE_DIR}/src/sf3500/hwaudio.c)
 
 
 add_library(bgdrtm STATIC ${BGDRTM_SOURCE_FILES})
@@ -168,6 +163,7 @@ target_include_directories(bgdrtm PRIVATE
                     ${CMAKE_SOURCE_DIR}/modules/mod_multi/
                     ${CMAKE_SOURCE_DIR}/modules/mod_chipmunk/
                     ${CMAKE_SOURCE_DIR}/modules/mod_iap/
+                    ${CMAKE_SOURCE_DIR}/src/sf3500
                     ${SDL2_INCLUDE_DIR}
                     ${SDL2_MIXER_INCLUDE_DIRS}
                     ${ZLIB_INCLUDE_DIRS}
@@ -184,7 +180,17 @@ set(BGDI_SOURCE_FILES
 
 # Include dirs
 
-set(EXTRA_LIBS "-lm")
+# -ldl/-lpthread: hwaudio.c (linked inside SDL2::SDL2-static) dlopen()s
+# driver_sf3500.so and runs a SCHED_FIFO consumer thread - a static
+# library doesn't propagate its own transitive link deps through our
+# hand-written FindSDL2.cmake's plain IMPORTED target, so these must be
+# listed explicitly on the final executable's own link line.
+set(EXTRA_LIBS "-lm" "-ldl" "-lpthread")
+# -rdynamic: exports our own statically-linked symbols to the dynamic
+# symbol table so backtrace_symbols_fd() (no core-dump support on this
+# device - see sf3500_crash_handler in main.c) can resolve real function
+# names, not just addresses.
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic")
 
 # Main executable
 add_executable(${PROJECT_NAME} ${BGDI_SOURCE_FILES})
@@ -197,37 +203,17 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 # Include the compiler flags from the external include file
 include(compiler_flags)
 
-# Link the executable to the libraries
+# Link the executable to the libraries. modplug/xmp/stdc++/opusfile/opus/
+# ogg/FLAC/vorbisfile/mikmod/mpg123 dropped - confirmed dead weight for
+# this build (see the OGG/Vorbis find_package note above).
 target_link_libraries(${PROJECT_NAME}
                       bgdrtm
                       ${SDL2_MIXER_LIBRARIES}
-                      modplug
-                      xmp
-                      stdc++
-                      opusfile
-                      opus
-                      ogg 
-                      SDL2::SDL2-static
+                      SDL2::SDL2
                       ${PNG_LIBRARIES}
                       libtre
                       ${ZLIB_LIBRARIES}
-                      FLAC
-                      vorbisfile
-                      ${VORBIS_LIBRARY}
-                      ${OGG_LIBRARY}
-                      mikmod
-                      mpg123
                       ${EXTRA_LIBS})
 
-set(VITA_APP_NAME "SoRR")
-set(VITA_TITLEID  "SORR00001")
-set(VITA_VERSION  "01.00")
-set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1")
-set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
-
-vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} UNSAFE)
-vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
-    VERSION ${VITA_VERSION}
-    NAME ${VITA_APP_NAME}
-    FILE sce_sys sce_sys
-)
+# No Vita packaging tail (vita_create_self/vita_create_vpk) - this is the
+# SF3500 MIPS build, ${PROJECT_NAME} ("sorr") is the final ELF to deploy.

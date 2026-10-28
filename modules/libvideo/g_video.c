@@ -37,6 +37,7 @@
 #include "dlvaracc.h"
 
 #include "libvideo.h"
+#include "hwdisp.h"
 
 #ifdef _WIN32
 #include <initguid.h>
@@ -285,6 +286,37 @@ int gr_set_mode( int width, int height, int depth )
 
     SDL_Log("Called set_mode with %dx%dx%d", width, height, depth);
 
+    /* SF3500: confirmed on real hardware - a SECOND set_mode call to a
+     * DIFFERENT resolution (SORR's own widescreen switch, 320x240 ->
+     * 416x240) re-runs the whole hardware video pipeline init a second
+     * time (fb close/reopen, hcge_driver_init again) and blocks the
+     * calling thread for ~14 real seconds while it does - confirmed by
+     * a per-second call-rate counter on the main event-pump hook
+     * showing exactly 1 call across that whole window. Removing SORR's
+     * own enable_widescreen/auto_widescreen asset toggles did NOT
+     * prevent the script from still requesting it - fixed at the engine
+     * level instead: once video is initialized, silently ignore any
+     * later request for a DIFFERENT resolution and keep the one already
+     * running. This device's HCGE driver has no fast path for a runtime
+     * mode change; losing widescreen is a far better trade than a
+     * 14-second input-dead stall every time. See sorr_handoff project
+     * memory. */
+    /* SF3500: guard DISABLED for a real test now that the audio postmix
+     * fix (mod_sound.c/hwaudio) is in place - the earlier measured
+     * "14 second block" may have been the audio stall the whole time
+     * (coincidentally logged right after this widescreen attempt), not
+     * this video re-init at all. If this test shows the switch is
+     * genuinely fast/clean now, remove this guard and the #if 0 block
+     * below permanently. If it's still slow, flip back to 1. See
+     * sorr_handoff project memory. */
+#if 0
+    if ( scr_initialized && width && height && ( width != scr_width || height != scr_height ) )
+    {
+        SDL_Log( "SF3500: ignoring resolution change to %dx%d (already running at %dx%d, runtime mode switch is too slow on this hw)", width, height, scr_width, scr_height );
+        return 0;
+    }
+#endif
+
     full_screen = ( GLODWORD( libvideo, GRAPH_MODE ) & MODE_FULLSCREEN ) ? 1 : 0 ;
     double_buffer = ( GLODWORD( libvideo, GRAPH_MODE ) & MODE_DOUBLEBUFFER ) ? 1 : 0 ;
     hardware_scr = ( GLODWORD( libvideo, GRAPH_MODE ) & MODE_HARDWARE ) ? 1 : 0 ;
@@ -499,6 +531,8 @@ void __bgdexport( libvideo, module_initialize )()
 
     if ( !SDL_WasInit( SDL_INIT_VIDEO ) ) SDL_InitSubSystem( SDL_INIT_VIDEO );
 
+    hwdisp_init();
+
 #ifdef _WIN32
     if ( !directdraw ) init_dx();
 #endif
@@ -541,6 +575,8 @@ void __bgdexport( libvideo, module_finalize )()
     }
 
     if ( SDL_WasInit( SDL_INIT_VIDEO ) ) SDL_QuitSubSystem( SDL_INIT_VIDEO );
+
+    hwdisp_deinit();
 }
 
 /* --------------------------------------------------------------------------- */

@@ -28,6 +28,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include "hwdisp.h"
 
 #define __LIB_RENDER
 #include "librender.h"
@@ -146,6 +147,14 @@ void gr_draw_screen( GRAPH * dest, int restore_type, int dump_type )
 
 static int screen_locked = 0 ;
 
+/* SF3500 hw video output - converts whatever bpp the game script picked
+ * into the RGB565 hwdisp_present() needs, growing the scratch buffer
+ * lazily. Skips the conversion entirely when screen is already RGB565
+ * (the common case for a 2D brawler), same shape as every other port, its
+ * final hw-present hook. See sorr_handoff project memory. */
+static unsigned short * hw_rgb565_buf = NULL;
+static int hw_rgb565_buf_pixels = 0;
+
 int gr_lock_screen()
 {
     if ( screen_locked ) return 1 ;
@@ -176,10 +185,27 @@ void gr_unlock_screen()
     // I removed the dirty rectangles code, for the time being
     if ( SDL_MUSTLOCK( screen ) ) SDL_UnlockSurface( screen ) ;
     if ( waitvsync ) gr_wait_vsync();
-    SDL_UpdateTexture(texture, NULL, screen->pixels, screen->pitch);
-    SDL_RenderClear(renderer);
-    SDL_RenderCopy(renderer, texture, NULL, NULL);
-    SDL_RenderPresent(renderer);
+    if ( screen->format->format == SDL_PIXELFORMAT_RGB565 )
+    {
+        hwdisp_present( screen->pixels, screen->w, screen->h, screen->pitch );
+    }
+    else
+    {
+        int needed_pixels = screen->w * screen->h;
+        if ( needed_pixels > hw_rgb565_buf_pixels )
+        {
+            if ( hw_rgb565_buf ) free( hw_rgb565_buf );
+            hw_rgb565_buf = (unsigned short *) malloc( needed_pixels * sizeof( unsigned short ) );
+            hw_rgb565_buf_pixels = hw_rgb565_buf ? needed_pixels : 0;
+        }
+        if ( hw_rgb565_buf )
+        {
+            SDL_ConvertPixels( screen->w, screen->h,
+                                screen->format->format, screen->pixels, screen->pitch,
+                                SDL_PIXELFORMAT_RGB565, hw_rgb565_buf, screen->w * 2 );
+            hwdisp_present( hw_rgb565_buf, screen->w, screen->h, screen->w * 2 );
+        }
+    }
 }
 
 /* --------------------------------------------------------------------------- */

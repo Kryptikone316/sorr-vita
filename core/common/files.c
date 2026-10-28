@@ -980,12 +980,18 @@ FILE * file_fp( file * f )
 
 char * getfullpath( char *rel_path )
 {
-    printf("getfullpath %s\n", rel_path);
     char fullpath[ __MAX_PATH ] = "";
 #ifdef _WIN32
     GetFullPathName( rel_path, sizeof( fullpath ), fullpath, NULL );
 #else
-//    realpath( rel_path, fullpath );
+    /* SF3500: was commented out upstream - harmless on the Vita build
+     * (TARGET_VITA skips this whole function via its own #ifdef branch
+     * in main.c), but fatal here: an empty fullpath makes this return
+     * NULL, and main.c's very next line unconditionally does
+     * strstr(appexefullpath, appexename) with no NULL check - instant
+     * segfault, confirmed root cause of the first real-hardware crash.
+     * See sorr_handoff project memory. */
+    realpath( rel_path, fullpath );
 #endif
     if ( *fullpath ) return strdup( fullpath );
     return NULL;
