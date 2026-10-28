@@ -1,0 +1,895 @@
+diff -ruN -x 'build-*' -x '*.before-pacing' sdl-pristine/SDL2-2.0.14/CMakeLists.txt SDL2-2.0.14/CMakeLists.txt
+--- a/CMakeLists.txt	2020-12-21 11:44:36.000000000 -0600
++++ b/CMakeLists.txt	2026-10-10 22:27:04.883238100 -0500
+@@ -344,6 +344,7 @@
+ set_option(ARMNEON             "use NEON assembly blitters on ARM" OFF)
+ set_option(DISKAUDIO           "Support the disk writer audio driver" ON)
+ set_option(DUMMYAUDIO          "Support the dummy audio driver" ON)
++set_option(HWAUDIO             "Support the SF3500 hardware audio driver" ON)
+ set_option(VIDEO_DIRECTFB      "Use DirectFB video driver" OFF)
+ dep_option(DIRECTFB_SHARED     "Dynamically load directfb support" ON "VIDEO_DIRECTFB" OFF)
+ set_option(VIDEO_DUMMY         "Use dummy video driver" ON)
+@@ -924,6 +925,29 @@
+     set(SOURCE_FILES ${SOURCE_FILES} ${DISKAUDIO_SOURCES})
+     set(HAVE_DISKAUDIO TRUE)
+   endif()
++  if(HWAUDIO)
++    set(SDL_AUDIO_DRIVER_HWAUDIO 1)
++    file(GLOB HWAUDIO_SOURCES ${SDL2_SOURCE_DIR}/src/audio/hwaudio/*.c)
++    set(SOURCE_FILES ${SOURCE_FILES} ${HWAUDIO_SOURCES})
++    set(HAVE_HWAUDIO TRUE)
++    set(EXTRA_LIBS ${EXTRA_LIBS} dl pthread)
++    # hwaudio.c is reused verbatim from the proven TinySTG/Manic Miner
++    # hardware backend (see sorr_handoff/sf3500_port_pipeline_recipe
++    # project memory) - its C99-style mixed declarations are intentional,
++    # not a bug to "fix" here, so relax just this one build's C90 strictness
++    # instead of editing a file hardened across 8 real-hardware rounds.
++    set_source_files_properties(${SDL2_SOURCE_DIR}/src/audio/hwaudio/hwaudio.c
++      PROPERTIES COMPILE_FLAGS "-Wno-error=declaration-after-statement")
++    # Synthetic-keyboard bridge (SORR/libkey.c reads SDL_GetKeyboardState,
++    # which nothing ever updates under VIDEO_DUMMY with no real keyboard -
++    # see sorr_handoff project memory). Gated on the same HWAUDIO option
++    # since this whole SDL2 build only ever exists for this one SF3500
++    # port - not a real separate feature worth its own toggle.
++    file(GLOB SF3500INPUT_SOURCES ${SDL2_SOURCE_DIR}/src/events/sf3500/*.c)
++    set(SOURCE_FILES ${SOURCE_FILES} ${SF3500INPUT_SOURCES})
++    set_source_files_properties(${SDL2_SOURCE_DIR}/src/events/sf3500/joykey.c
++      PROPERTIES COMPILE_FLAGS "-Wno-error=declaration-after-statement")
++  endif()
+ endif()
+ 
+ if(SDL_DLOPEN)
+diff -ruN -x 'build-*' -x '*.before-pacing' sdl-pristine/SDL2-2.0.14/include/SDL_config.h.cmake SDL2-2.0.14/include/SDL_config.h.cmake
+--- a/include/SDL_config.h.cmake	2020-12-21 11:44:36.000000000 -0600
++++ b/include/SDL_config.h.cmake	2026-10-10 22:09:10.267467500 -0500
+@@ -266,6 +266,7 @@
+ #cmakedefine SDL_AUDIO_DRIVER_DSOUND @SDL_AUDIO_DRIVER_DSOUND@
+ #cmakedefine SDL_AUDIO_DRIVER_DUMMY @SDL_AUDIO_DRIVER_DUMMY@
+ #cmakedefine SDL_AUDIO_DRIVER_EMSCRIPTEN @SDL_AUDIO_DRIVER_EMSCRIPTEN@
++#cmakedefine SDL_AUDIO_DRIVER_HWAUDIO @SDL_AUDIO_DRIVER_HWAUDIO@
+ #cmakedefine SDL_AUDIO_DRIVER_ESD @SDL_AUDIO_DRIVER_ESD@
+ #cmakedefine SDL_AUDIO_DRIVER_ESD_DYNAMIC @SDL_AUDIO_DRIVER_ESD_DYNAMIC@
+ #cmakedefine SDL_AUDIO_DRIVER_FUSIONSOUND @SDL_AUDIO_DRIVER_FUSIONSOUND@
+diff -ruN -x 'build-*' -x '*.before-pacing' sdl-pristine/SDL2-2.0.14/src/audio/hwaudio/hwaudio.c SDL2-2.0.14/src/audio/hwaudio/hwaudio.c
+--- a/src/audio/hwaudio/hwaudio.c	1969-12-31 18:00:00.000000000 -0600
++++ b/src/audio/hwaudio/hwaudio.c	2026-10-10 22:02:20.819564866 -0500
+@@ -0,0 +1,223 @@
++#include "hwaudio.h"
++
++#include <stdio.h>
++#include <string.h>
++#include <dlfcn.h>
++#include <unistd.h>
++#include <pthread.h>
++#include <time.h>
++#include <sched.h>
++
++static void  *g_handle = NULL;
++static int    g_active = 0;
++
++typedef int (*fn_init_t)(void *device_name, int sample_rate, int channels);
++typedef int (*fn_play_t)(const void *buffer, int frame_count);
++typedef int (*fn_deinit_t)(void);
++
++static fn_init_t   p_init   = NULL;
++static fn_play_t   p_play   = NULL;
++static fn_deinit_t p_deinit = NULL;
++
++/* Ring buffer (frames), written by the game loop (any timing), drained by
++ * our own steady-paced thread. Free-running frame counters, masked by
++ * HWAUDIO_RING_FRAMES (power of two, defined in hwaudio.h - see its comment
++ * for why the size and soft cap live there, shared with every caller,
++ * instead of being guessed independently per file like the earlier,
++ * repeatedly-wrong attempts at this same fix). */
++#define RING_MASK (HWAUDIO_RING_FRAMES - 1)
++static short ring[HWAUDIO_RING_FRAMES * 2];
++static unsigned ring_w = 0, ring_r = 0;
++static pthread_mutex_t ring_mtx = PTHREAD_MUTEX_INITIALIZER;
++
++static pthread_t audio_thread;
++static volatile int thread_running = 0;
++
++static void *audio_thread_fn(void *unused) {
++    struct timespec next_wake;
++    long period_ns;
++    short chunk[HWAUDIO_CHUNK * 2];
++    (void)unused;
++    /* 32-bit long overflows computing 480 * 1e9 directly on this target -
++     * confirmed by the compiler's own overflow warning. long long avoids it;
++     * the final result (~10,000,000ns) fits a 32-bit tv_nsec field fine. */
++    period_ns = (long)((long long)HWAUDIO_CHUNK * 1000000000LL / HWAUDIO_RATE); /* 10ms */
++
++    /* Absolute-deadline pacing, not a plain nanosleep(10ms) every iteration.
++     * audiotest found (2026-10-09, real hardware) a genuine, steady ring
++     * growth even after the ring itself was made far bigger - roughly 464
++     * extra frames/sec accumulating, confirming the consumer's REAL average
++     * tick period was running slightly longer than the nominal 10ms. A
++     * relative nanosleep(&delay) re-bases its sleep off "now" every
++     * iteration, so this loop's own overhead (the mutex lock, the 480-frame
++     * copy, and critically p_play() - a real call into the closed-source
++     * driver that is NOT instantaneous) all compound into the period
++     * instead of being measured against a fixed schedule. Scheduling
++     * against an absolute deadline that only ever advances by a fixed
++     * period - irrespective of how long the loop body took - cancels that
++     * compounding out, the standard fix for a periodic POSIX thread. */
++    clock_gettime(CLOCK_MONOTONIC, &next_wake);
++
++    while (thread_running) {
++        next_wake.tv_nsec += period_ns;
++        if (next_wake.tv_nsec >= 1000000000L) {
++            next_wake.tv_nsec -= 1000000000L;
++            next_wake.tv_sec += 1;
++        }
++        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_wake, NULL);
++
++        pthread_mutex_lock(&ring_mtx);
++        if (ring_w - ring_r >= (unsigned)HWAUDIO_CHUNK) {
++            int i;
++            for (i = 0; i < HWAUDIO_CHUNK; i++) {
++                unsigned idx = (ring_r + i) & RING_MASK;
++                chunk[i * 2]     = ring[idx * 2];
++                chunk[i * 2 + 1] = ring[idx * 2 + 1];
++            }
++            ring_r += HWAUDIO_CHUNK;
++        } else {
++            /* Underrun: feed silence so the driver keeps a steady cadence
++             * instead of us skipping the tick (same spirit as picoarch's own
++             * "keep the consumer alive" comment). */
++            memset(chunk, 0, sizeof(chunk));
++        }
++        pthread_mutex_unlock(&ring_mtx);
++
++        p_play(chunk, HWAUDIO_CHUNK);
++    }
++    return NULL;
++}
++
++/* Retrying init (confirmed pattern from picoarch: the driver can transiently
++ * fail right after boot/process handoff; retry up to 20 times, 100ms apart). */
++static int try_init(void) {
++    int rc = -1;
++    int try;
++    for (try = 0; try < 20; try++) {
++        rc = p_init(NULL, HWAUDIO_RATE, 2);
++        if (rc >= 0) break;
++        usleep(100 * 1000);
++    }
++    return rc;
++}
++
++int hwaudio_init(void) {
++    if (g_active) return 0;
++
++    g_handle = dlopen("/mnt/sdcard/cubegm/driver_sf3500.so", RTLD_NOW | RTLD_GLOBAL);
++    if (!g_handle) {
++        fprintf(stderr, "hwaudio: dlopen failed: %s\n", dlerror());
++        return -1;
++    }
++
++    p_init   = (fn_init_t)  dlsym(g_handle, "sound_driver_init");
++    p_play   = (fn_play_t)  dlsym(g_handle, "sound_driver_playframe");
++    p_deinit = (fn_deinit_t)dlsym(g_handle, "sound_driver_deinit");
++
++    if (!p_init || !p_play) {
++        fprintf(stderr, "hwaudio: dlsym failed (init=%p play=%p)\n", (void*)p_init, (void*)p_play);
++        dlclose(g_handle); g_handle = NULL;
++        return -1;
++    }
++
++    /* Clean-cycle workaround (confirmed from picoarch): first init can report
++     * success while leaving the hardware half-alive - open, close, re-open. */
++    if (try_init() < 0) {
++        fprintf(stderr, "hwaudio: initial sound_driver_init failed\n");
++        dlclose(g_handle); g_handle = NULL;
++        return -1;
++    }
++    fprintf(stderr, "hwaudio: clean AUDDEC/I2SO startup cycle\n");
++    if (p_deinit) p_deinit();
++    usleep(100 * 1000);
++
++    if (try_init() < 0) {
++        fprintf(stderr, "hwaudio: second sound_driver_init failed\n");
++        dlclose(g_handle); g_handle = NULL;
++        return -1;
++    }
++
++    ring_w = ring_r = 0;
++    thread_running = 1;
++    {
++        /* Device is single-core (confirmed) - without a scheduling guarantee,
++         * heavier game logic (real gameplay vs the menu) can delay this
++         * thread's 10ms wake-up past what the ring buffer's small cushion can
++         * absorb, confirmed real-hardware symptom: fine in the menu, stutters
++         * once gameplay starts. SCHED_FIFO makes the kernel always preempt
++         * the normal-priority game thread for this one instead of leaving it
++         * to best-effort time-slicing. Falls back to default scheduling if
++         * this process lacks the privilege (logged, not fatal - embedded
++         * Linux here runs as root, so expected to succeed). */
++        pthread_attr_t attr;
++        struct sched_param sp;
++        int created;
++
++        pthread_attr_init(&attr);
++        pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
++        pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
++        sp.sched_priority = sched_get_priority_max(SCHED_FIFO) - 1;
++        pthread_attr_setschedparam(&attr, &sp);
++
++        created = pthread_create(&audio_thread, &attr, audio_thread_fn, NULL);
++        if (created != 0) {
++            fprintf(stderr, "hwaudio: SCHED_FIFO thread create failed (%d), falling back to default scheduling\n", created);
++            created = pthread_create(&audio_thread, NULL, audio_thread_fn, NULL);
++        }
++        pthread_attr_destroy(&attr);
++
++        if (created != 0) {
++            fprintf(stderr, "hwaudio: failed to start audio thread\n");
++            thread_running = 0;
++            if (p_deinit) p_deinit();
++            dlclose(g_handle); g_handle = NULL;
++            return -1;
++        }
++    }
++
++    g_active = 1;
++    fprintf(stderr, "hwaudio: active (rate=%d chunk=%d, dedicated thread)\n", HWAUDIO_RATE, HWAUDIO_CHUNK);
++    return 0;
++}
++
++int hwaudio_active(void) { return g_active; }
++
++/* Returns the number of frames actually accepted (<= frames) - the soft cap
++ * can silently accept fewer than requested, and the caller's own drift-free
++ * output accounting (SoundStream.cpp) MUST advance by the real accepted
++ * count, not the requested one, or dropped frames permanently corrupt that
++ * bookkeeping (found 2026-10-09: the old void-returning version let
++ * out_frames_produced silently drift ahead of what the ring actually got,
++ * compounding into exactly the kind of systematic shortfall the throughput
++ * fix was supposed to eliminate). */
++int hwaudio_write(const short *buf, int frames) {
++    int i;
++    if (!g_active) return 0;
++
++    pthread_mutex_lock(&ring_mtx);
++    for (i = 0; i < frames; i++) {
++        if (ring_w - ring_r >= HWAUDIO_RING_SOFT_CAP) {
++            /* Already have enough cushion ahead of the consumer - drop the
++             * rest of this call's frames instead of letting the ring grow
++             * toward HWAUDIO_RING_FRAMES and eventually chop a whole chunk
++             * at once. */
++            break;
++        }
++        unsigned idx = ring_w & RING_MASK;
++        ring[idx * 2]     = buf[i * 2];
++        ring[idx * 2 + 1] = buf[i * 2 + 1];
++        ring_w++;
++    }
++    pthread_mutex_unlock(&ring_mtx);
++    return i;
++}
++
++void hwaudio_deinit(void) {
++    if (!g_active) return;
++    thread_running = 0;
++    pthread_join(audio_thread, NULL);
++    if (p_deinit) p_deinit();
++    if (g_handle) { dlclose(g_handle); g_handle = NULL; }
++    p_init = NULL; p_play = NULL; p_deinit = NULL;
++    g_active = 0;
++}
+diff -ruN -x 'build-*' -x '*.before-pacing' sdl-pristine/SDL2-2.0.14/src/audio/hwaudio/hwaudio.h SDL2-2.0.14/src/audio/hwaudio/hwaudio.h
+--- a/src/audio/hwaudio/hwaudio.h	1969-12-31 18:00:00.000000000 -0600
++++ b/src/audio/hwaudio/hwaudio.h	2026-10-10 22:02:20.823564866 -0500
+@@ -0,0 +1,71 @@
++/* Real audio via driver_sf3500.so's sound_driver_* functions - see hwaudio.c
++ * for the calling-convention and clean-cycle fixes (confirmed from
++ * picoarch's own production source).
++ *
++ * Playback runs on a DEDICATED background thread, mirroring picoarch's own
++ * architecture (sf3000_audio_thread_fn in plat_sdl.c): a ring buffer the
++ * game loop writes into non-blocking, drained in steady 480-frame/10ms
++ * chunks by a thread that wakes on its own schedule. Confirmed real-hardware
++ * reason this is required, not just a nicety: calling sound_driver_playframe
++ * synchronously from the main game loop (which has zero frame-pacing of its
++ * own - no SDL_Delay/vsync-wait anywhere in this port) produced audible
++ * stutter/muffling - irregular feed timing into a real-time hardware sink.
++ * The dedicated thread decouples playback timing from however fast/slow the
++ * game loop happens to run. */
++#ifndef SF3000_HWAUDIO_H
++#define SF3000_HWAUDIO_H
++
++#define HWAUDIO_RATE  48000
++#define HWAUDIO_CHUNK 480   /* frames (10ms @ 48000Hz), fixed by the driver */
++
++/* Ring sizing - the SINGLE shared source of truth for both hwaudio.c's own
++ * buffer and every caller's backlog-cap math (SoundStream.cpp, audiotest.c).
++ * Previously these were sized independently in different files with no
++ * shared knowledge of each other's real values - found on real hardware
++ * (2026-10-09, five rounds of testing on TinySTG) that this is exactly how
++ * a "fixed" backlog cap kept reintroducing the same bug at a smaller scale:
++ * each cap was arbitrary relative to what the ring could actually hold, so
++ * the gap between "requested" and "accepted" never settled near zero, it
++ * just oscillated at whatever the latest guessed cap size was. A single
++ * port-agnostic definition here means every future port's SoundStream-
++ * equivalent sizes its own backlog cap FROM this, not from a second guess.
++ *
++ * HWAUDIO_RING_FRAMES is deliberately generous (2 real seconds) rather than
++ * tightly tuned to the "ideal" drain rate: the producer and consumer are
++ * paced by two independent real-time clocks (CLOCK_MONOTONIC vs
++ * nanosleep(10ms)) that will never match exactly, so SOME slack has to
++ * exist for the honest accepted-count feedback loop to actually converge
++ * instead of perpetually hitting a cap that's too close to the real
++ * drain rate to recover from. HWAUDIO_RING_SOFT_CAP leaves 25% headroom
++ * below the hard array size, so a genuine worst-case burst still has room
++ * before hwaudio_write()'s own drop-the-rest-of-this-call behavior kicks in. */
++/* Must stay a power of two - hwaudio.c masks the ring index with
++ * (HWAUDIO_RING_FRAMES - 1) instead of a slower modulo. 65536 frames is
++ * ~1.37 real seconds at 48000Hz - not a round "2 seconds", chosen instead
++ * for the nearest convenient power of two comfortably above that target. */
++#define HWAUDIO_RING_FRAMES    65536
++#define HWAUDIO_RING_SOFT_CAP  (HWAUDIO_RING_FRAMES * 3 / 4)
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++int  hwaudio_init(void);
++int  hwaudio_active(void);
++
++/* Non-blocking: copies into the ring buffer and returns immediately. Safe to
++ * call from the main game loop regardless of its own timing. May accept
++ * fewer than `frames` if the ring already has enough cushion ahead of the
++ * consumer - returns the number ACTUALLY accepted. Callers that track their
++ * own cumulative output total (e.g. SoundStream's drift-free accounting)
++ * MUST advance by the return value, not the requested count, or dropped
++ * frames silently corrupt that bookkeeping. */
++int hwaudio_write(const short *buf, int frames);
++
++void hwaudio_deinit(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff -ruN -x 'build-*' -x '*.before-pacing' sdl-pristine/SDL2-2.0.14/src/audio/hwaudio/SDL_hwaudio.c SDL2-2.0.14/src/audio/hwaudio/SDL_hwaudio.c
+--- a/src/audio/hwaudio/SDL_hwaudio.c	1969-12-31 18:00:00.000000000 -0600
++++ b/src/audio/hwaudio/SDL_hwaudio.c	2026-10-11 02:35:15.755948100 -0500
+@@ -0,0 +1,137 @@
++/*
++  SF3500 hardware audio driver for Streets of Rage Remake (BennuGD/sorr-vita).
++
++  SORR's audio goes through SDL2_mixer's own internal mixing callback
++  (Mix_OpenAudio -> SDL_OpenAudioDevice), not a single app-level call site -
++  unlike every prior SF3500 port (TinySTG, Doom, etc.) there is no one
++  function to patch to route into hwaudio_write(). Writing a real SDL2
++  audio driver means SDL2_mixer and SORR's own mod_sound.c need ZERO
++  changes: SDL2's own audio core thread calls our PlayDevice() exactly
++  like it would call any real hardware driver.
++
++  Pacing: WaitDevice()'s SDL_Delay matches the chunk duration, same lesson
++  learned the hard way across TinySTG's audio arc (round 1: a producer
++  calling a push function far faster than needed starves a real-time
++  consumer thread via lock/scheduling overhead alone, even on hardware
++  that's otherwise fast enough). hwaudio_write() itself is non-blocking
++  and has its own hardened ring+absolute-deadline consumer thread (see
++  hwaudio.h) - this driver doesn't need its own backpressure logic beyond
++  not calling PlayDevice faster than real time.
++*/
++#include "../../SDL_internal.h"
++
++#if SDL_AUDIO_DRIVER_HWAUDIO
++
++#include "SDL_timer.h"
++#include "SDL_audio.h"
++#include "../SDL_audio_c.h"
++#include "SDL_hwaudio.h"
++#include "hwaudio.h"
++
++static void
++HWAUDIO_WaitDevice(_THIS)
++{
++    SDL_Delay((this->spec.samples * 1000) / this->spec.freq);
++}
++
++static void
++HWAUDIO_PlayDevice(_THIS)
++{
++    hwaudio_write((const short *) this->hidden->mixbuf, this->spec.samples);
++}
++
++static Uint8 *
++HWAUDIO_GetDeviceBuf(_THIS)
++{
++    return this->hidden->mixbuf;
++}
++
++static void
++HWAUDIO_CloseDevice(_THIS)
++{
++    hwaudio_deinit();
++    if (this->hidden->mixbuf) {
++        SDL_free(this->hidden->mixbuf);
++    }
++    SDL_free(this->hidden);
++}
++
++static int
++HWAUDIO_OpenDevice(_THIS, void *handle, const char *devname, int iscapture)
++{
++    /* SF3500: this custom driver is no longer used by SORR - confirmed
++     * on real hardware that routing through it exposed a zero-channel
++     * SDL_AudioStream bug inside SDL2's own device/resampling machinery
++     * that stalled the entire process. Switched to C-Dogs' own proven
++     * architecture instead (Mix_SetPostMix() tapping SDL_mixer's already-
++     * mixed buffer directly, bypassing this driver and SDL2's AudioStream
++     * entirely - see mod_sound.c's SF3500_AudioPostMix). `sorr.sh` forces
++     * SDL_AUDIODRIVER=dummy so this code path is never even reached.
++     * Left intact (not deleted) in case a future port on this device
++     * genuinely needs a custom driver and doesn't have SDL_mixer sitting
++     * in the way the way SORR did. See sorr_handoff project memory. */
++    if (iscapture) {
++        return SDL_SetError("hwaudio: capture not supported");
++    }
++
++    if (hwaudio_init() != 0) {
++        return SDL_SetError("hwaudio: hwaudio_init() failed");
++    }
++
++    this->hidden = (struct SDL_PrivateAudioData *) SDL_calloc(1, sizeof(*this->hidden));
++    if (this->hidden == NULL) {
++        hwaudio_deinit();
++        return SDL_OutOfMemory();
++    }
++
++    /* The device is fixed-rate real hardware (see hwaudio.h) - report the
++     * OBTAINED spec as exactly what hwaudio.c requires. SDL2's own audio
++     * core handles converting whatever Mix_OpenAudio/the app actually
++     * requested into this, so this driver never needs its own resampler
++     * (every prior port's audio pain was from NOT having this layer). */
++    this->spec.freq = HWAUDIO_RATE;
++    this->spec.format = AUDIO_S16SYS;
++    this->spec.channels = 2;
++    this->spec.samples = HWAUDIO_CHUNK;
++
++    this->hidden->mixbuf_len = HWAUDIO_CHUNK * 2 * (int) sizeof(Sint16);
++    this->hidden->mixbuf = (Uint8 *) SDL_malloc(this->hidden->mixbuf_len);
++    if (this->hidden->mixbuf == NULL) {
++        SDL_free(this->hidden);
++        this->hidden = NULL;
++        hwaudio_deinit();
++        return SDL_OutOfMemory();
++    }
++    SDL_memset(this->hidden->mixbuf, 0, this->hidden->mixbuf_len);
++
++    return 0;
++}
++
++static void
++HWAUDIO_DetectDevices(void)
++{
++    SDL_AddAudioDevice(SDL_FALSE, DEFAULT_OUTPUT_DEVNAME, (void *) 0x1);
++}
++
++static int
++HWAUDIO_Init(SDL_AudioDriverImpl * impl)
++{
++    impl->OpenDevice = HWAUDIO_OpenDevice;
++    impl->WaitDevice = HWAUDIO_WaitDevice;
++    impl->PlayDevice = HWAUDIO_PlayDevice;
++    impl->GetDeviceBuf = HWAUDIO_GetDeviceBuf;
++    impl->CloseDevice = HWAUDIO_CloseDevice;
++    impl->DetectDevices = HWAUDIO_DetectDevices;
++
++    impl->OnlyHasDefaultOutputDevice = 1;
++    impl->HasCaptureSupport = SDL_FALSE;
++
++    return 1;
++}
++
++AudioBootStrap HWAUDIO_bootstrap = {
++    "hwaudio", "SF3500 hardware audio driver", HWAUDIO_Init, 0
++};
++
++#endif /* SDL_AUDIO_DRIVER_HWAUDIO */
++/* vi: set ts=4 sw=4 expandtab: */
+diff -ruN -x 'build-*' -x '*.before-pacing' sdl-pristine/SDL2-2.0.14/src/audio/hwaudio/SDL_hwaudio.h SDL2-2.0.14/src/audio/hwaudio/SDL_hwaudio.h
+--- a/src/audio/hwaudio/SDL_hwaudio.h	1969-12-31 18:00:00.000000000 -0600
++++ b/src/audio/hwaudio/SDL_hwaudio.h	2026-10-10 22:02:31.419563485 -0500
+@@ -0,0 +1,23 @@
++/* SF3500 hardware audio driver - bridges SDL2's audio core into the
++ * device's real hwaudio.c (driver_sf3500.so) backend, so SDL2_mixer and
++ * any code built on top of it (SORR's mod_sound.c) work unmodified -
++ * see sorr_handoff project memory for why this exists (SDL_mixer owns
++ * its own internal mixing callback, no single app-level call site to
++ * patch the way every prior SF3500 port did). */
++#include "../../SDL_internal.h"
++
++#ifndef SDL_hwaudio_h_
++#define SDL_hwaudio_h_
++
++#include "../SDL_sysaudio.h"
++
++#define _THIS   SDL_AudioDevice *this
++
++struct SDL_PrivateAudioData
++{
++    Uint8 *mixbuf;
++    int    mixbuf_len;
++};
++
++#endif /* SDL_hwaudio_h_ */
++/* vi: set ts=4 sw=4 expandtab: */
+diff -ruN -x 'build-*' -x '*.before-pacing' sdl-pristine/SDL2-2.0.14/src/audio/SDL_audio.c SDL2-2.0.14/src/audio/SDL_audio.c
+--- a/src/audio/SDL_audio.c	2020-12-21 11:44:36.000000000 -0600
++++ b/src/audio/SDL_audio.c	2026-10-28 02:33:25.979416701 -0500
+@@ -35,6 +35,9 @@
+ 
+ /* Available audio drivers */
+ static const AudioBootStrap *const bootstrap[] = {
++#if SDL_AUDIO_DRIVER_HWAUDIO
++    &HWAUDIO_bootstrap,
++#endif
+ #if SDL_AUDIO_DRIVER_PULSEAUDIO
+     &PULSEAUDIO_bootstrap,
+ #endif
+@@ -763,8 +766,27 @@
+             }
+         } else if (data == device->work_buffer) {
+             /* nothing to do; pause like we queued a buffer to play. */
+-            const Uint32 delay = ((device->spec.samples * 1000) / device->spec.freq);
+-            SDL_Delay(delay);
++            /* SF3500: pace against an absolute deadline instead of sleeping a
++             * fixed time after the callback. A relative SDL_Delay() makes every
++             * period the nominal time PLUS however long the callback took, so
++             * the callback rate falls steadily behind real time (measured on
++             * the device: 20 blocks a second against a nominal 21.5, about 6%
++             * short, which showed up as constant audio underruns when the
++             * output is fed to hardware that consumes in real time). The next
++             * deadline advances by exactly one buffer duration, with the
++             * fractional milliseconds kept, so the long-term rate is exact. If
++             * we ever fall more than two buffers behind, start again from now
++             * rather than rushing to catch up. */
++            const Uint64 pfreq = SDL_GetPerformanceFrequency();
++            const Uint64 period = ((Uint64) device->spec.samples * pfreq) / (Uint64) device->spec.freq;
++            const Uint64 now = SDL_GetPerformanceCounter();
++            if (device->sf3500_next == 0 || now > device->sf3500_next + (2 * period)) {
++                device->sf3500_next = now;
++            }
++            device->sf3500_next += period;
++            if (device->sf3500_next > now) {
++                SDL_Delay((Uint32) (((device->sf3500_next - now) * 1000) / pfreq));
++            }
+         } else {  /* writing directly to the device. */
+             /* queue this buffer and wait for it to finish playing. */
+             current_audio.impl.PlayDevice(device);
+diff -ruN -x 'build-*' -x '*.before-pacing' sdl-pristine/SDL2-2.0.14/src/audio/SDL_audiocvt.c SDL2-2.0.14/src/audio/SDL_audiocvt.c
+--- a/src/audio/SDL_audiocvt.c	2020-12-21 11:44:36.000000000 -0600
++++ b/src/audio/SDL_audiocvt.c	2026-10-11 00:19:35.321743100 -0500
+@@ -28,6 +28,10 @@
+ #include "SDL.h"
+ #include "SDL_audio.h"
+ #include "SDL_audio_c.h"
++#ifndef _WIN32
++#include <unistd.h>
++#include <execinfo.h>
++#endif
+ 
+ #include "SDL_loadso.h"
+ #include "../SDL_dataqueue.h"
+@@ -1276,6 +1280,32 @@
+     Uint8 pre_resample_channels;
+     SDL_AudioStream *retval;
+ 
++    /* SF3500: root-level guard, not a per-caller patch - confirmed on
++     * real hardware that a 0 src_channels (a caller, e.g. a music codec
++     * reporting a bad/unready channel count, feeding garbage in here)
++     * makes src_sample_frame_size 0 below, and EVERY later
++     * SDL_AudioStreamPut() on this stream does `len % src_sample_frame_size`,
++     * an unconditional MIPS integer-divide trap (SIGFPE) - confirmed via
++     * addr2line against the exact crashing address. A per-call-site fix
++     * (e.g. music_ogg_stb.c's OGG_UpdateSection) wasn't enough - some
++     * OTHER caller hits the same 0. Fixing it once here, where every
++     * single SDL_AudioStreamPut-using caller in this codebase routes
++     * through, instead of chasing each one individually. See
++     * sorr_handoff project memory. */
++    if (src_channels == 0 || dst_channels == 0 ||
++        SDL_AUDIO_BITSIZE(src_format) == 0 || SDL_AUDIO_BITSIZE(dst_format) == 0) {
++        /* SF3500: channels alone wasn't the whole story - confirmed on a
++         * retest that this exact crash recurred with channels confirmed
++         * nonzero (verified by disassembling this function's own
++         * compiled checks), meaning src_sample_frame_size's OTHER factor,
++         * SDL_AUDIO_BITSIZE(src_format), was the real 0 this time (an
++         * invalid/never-set format value is not a valid AUDIO_* constant
++         * and reads back as bitsize 0). Widened the same guard rather
++         * than add a second one. */
++        SDL_InvalidParamError("src_channels/dst_channels/src_format/dst_format");
++        return NULL;
++    }
++
+     retval = (SDL_AudioStream *) SDL_calloc(1, sizeof (SDL_AudioStream));
+     if (!retval) {
+         return NULL;
+@@ -1523,7 +1553,48 @@
+         return SDL_InvalidParamError("buf");
+     } else if (len == 0) {
+         return 0;  /* nothing to do. */
+-    } else if ((len % stream->src_sample_frame_size) != 0) {
++    }
++
++    /* SF3500: real-hardware SIGFPE confirmed here (len % src_sample_frame_size
++     * with src_sample_frame_size==0) SURVIVES a creation-time guard in
++     * SDL_NewAudioStream rejecting 0 channels/format - meaning this exact
++     * stream was validly created and something zeroed this field (or this
++     * isn't really a live SDL_AudioStream*) by the time this runs. Dumping
++     * every field instead of crashing blind, to tell corruption from a
++     * wrong-pointer bug. See sorr_handoff project memory. */
++    if (stream->src_sample_frame_size == 0) {
++#ifndef _WIN32
++        /* Confirmed real-hardware: this fires every single audio buffer
++         * cycle on a broken stream (42000+ times in one run) - print it
++         * once, not every call, to stop flooding the log / wasting time
++         * in a real-time thread. */
++        static int warned = 0;
++        if (!warned) {
++            char dbgmsg[256];
++            int dbglen = SDL_snprintf(dbgmsg, sizeof(dbgmsg),
++                "\n*** SF3500: SDL_AudioStreamPut would divide by zero - stream=%p len=%d\n"
++                "    src_sample_frame_size=%d src_format=0x%x src_channels=%u src_rate=%d\n"
++                "    dst_sample_frame_size=%d dst_format=0x%x dst_channels=%u dst_rate=%d\n"
++                "    (further occurrences suppressed)\n",
++                (void *) stream, len,
++                stream->src_sample_frame_size, (unsigned) stream->src_format, (unsigned) stream->src_channels, stream->src_rate,
++                stream->dst_sample_frame_size, (unsigned) stream->dst_format, (unsigned) stream->dst_channels, stream->dst_rate);
++            write(2, dbgmsg, dbglen);
++            /* backtrace() here REVERTED - two device hangs in a row right
++             * after adding it (one on a fresh boot, zero log output both
++             * times), not yet proven as the cause but a real suspect:
++             * this runs from SDL2's audio core thread at
++             * SDL_THREAD_PRIORITY_TIME_CRITICAL on a single-core device,
++             * and backtrace()/backtrace_symbols_fd() are not real-time-
++             * safe (dynamic symbol resolution, possible allocation). See
++             * sorr_handoff project memory before re-adding this. */
++            warned = 1;
++        }
++#endif
++        return SDL_SetError("src_sample_frame_size is 0 (SF3500 diagnostic)");
++    }
++
++    if ((len % stream->src_sample_frame_size) != 0) {
+         return SDL_SetError("Can't add partial sample frames");
+     }
+ 
+diff -ruN -x 'build-*' -x '*.before-pacing' sdl-pristine/SDL2-2.0.14/src/audio/SDL_sysaudio.h SDL2-2.0.14/src/audio/SDL_sysaudio.h
+--- a/src/audio/SDL_sysaudio.h	2020-12-21 11:44:36.000000000 -0600
++++ b/src/audio/SDL_sysaudio.h	2026-10-28 02:33:36.432035522 -0500
+@@ -143,6 +143,10 @@
+     /* Stream that converts and resamples. NULL if not needed. */
+     SDL_AudioStream *stream;
+ 
++    /* SF3500: next absolute deadline (performance counter ticks) of the paced
++       audio thread, see SDL_RunAudio() in SDL_audio.c. Zero until first used. */
++    Uint64 sf3500_next;
++
+     /* Current state flags */
+     SDL_atomic_t shutdown; /* true if we are signaling the play thread to end. */
+     SDL_atomic_t enabled;  /* true if device is functioning and connected. */
+@@ -202,6 +206,7 @@
+ extern AudioBootStrap COREAUDIO_bootstrap;
+ extern AudioBootStrap DISKAUDIO_bootstrap;
+ extern AudioBootStrap DUMMYAUDIO_bootstrap;
++extern AudioBootStrap HWAUDIO_bootstrap;
+ extern AudioBootStrap FUSIONSOUND_bootstrap;
+ extern AudioBootStrap openslES_bootstrap;
+ extern AudioBootStrap ANDROIDAUDIO_bootstrap;
+diff -ruN -x 'build-*' -x '*.before-pacing' sdl-pristine/SDL2-2.0.14/src/events/sf3500/joykey.c SDL2-2.0.14/src/events/sf3500/joykey.c
+--- a/src/events/sf3500/joykey.c	1969-12-31 18:00:00.000000000 -0600
++++ b/src/events/sf3500/joykey.c	2026-10-10 22:25:37.375257157 -0500
+@@ -0,0 +1,61 @@
++/* See joykey.h. Default bit table lifted from TreeFrogUI's own
++ * apps/image_viewer/image_viewer.c (same device, same shared-memory reader),
++ * with the same optional /mnt/sdcard/frogui/keymap.txt override so this
++ * respects whatever button remapping the user has already configured. */
++#include "joykey.h"
++
++#include <stdio.h>
++#include <string.h>
++#include <sys/ipc.h>
++#include <sys/shm.h>
++
++#define KEYMAP_FILE "/mnt/sdcard/frogui/keymap.txt"
++
++static const char *key_names[JK_COUNT] = {
++    "LEFT", "RIGHT", "UP", "DOWN", "A", "B", "L1", "R1", "X", "Y", "START", "SELECT"
++};
++static int key_bits[JK_COUNT] = { 7, 5, 2, 3, 13, 14, 10, 11, 12, 15, 1, 0 };
++
++static volatile unsigned int *cv_keys = NULL;
++
++static void load_keymap(void) {
++    FILE *f = fopen(KEYMAP_FILE, "r");
++    char line[64], name[32];
++    int bit, i;
++    if (!f) return;
++    while (fgets(line, sizeof(line), f)) {
++        if (sscanf(line, "%31[^=]=%d", name, &bit) != 2) continue;
++        for (i = 0; i < JK_COUNT; i++)
++            if (strcmp(name, key_names[i]) == 0 && bit >= 0 && bit < 32) key_bits[i] = bit;
++    }
++    fclose(f);
++}
++
++void joykey_init(void) {
++    key_t key;
++    int id;
++    void *mem;
++
++    load_keymap();
++
++    key = ftok("/tmp/joy_key", 'a');
++    if (key == (key_t)-1) return;
++    id = shmget(key, 4, 0666);
++    if (id < 0) return;
++    mem = shmat(id, NULL, 0);
++    if (mem != (void *)-1) cv_keys = (volatile unsigned int *)mem;
++}
++
++unsigned int joykey_read(void) {
++    unsigned int raw, out;
++    int i;
++
++    if (!cv_keys) return 0;
++
++    raw = *cv_keys & 0xFFFFu;
++    out = 0;
++    for (i = 0; i < JK_COUNT; i++) {
++        if (raw & (1u << key_bits[i])) out |= 1u << i;
++    }
++    return out;
++}
+diff -ruN -x 'build-*' -x '*.before-pacing' sdl-pristine/SDL2-2.0.14/src/events/sf3500/joykey.h SDL2-2.0.14/src/events/sf3500/joykey.h
+--- a/src/events/sf3500/joykey.h	1969-12-31 18:00:00.000000000 -0600
++++ b/src/events/sf3500/joykey.h	2026-10-10 22:25:37.379257155 -0500
+@@ -0,0 +1,32 @@
++/* Real gamepad input via cubevol's /tmp/joy_key shared memory - the same
++ * mechanism picoarch/FrogUI/the stock apps use on this device (confirmed via
++ * TreeFrogUI's own docs/dev/standalone-apps.md and source, e.g.
++ * apps/image_viewer/image_viewer.c). No uinput, no uncertain SDL joystick
++ * enumeration - this is the proven, working path. hcprojector (the stock
++ * evdev owner) isn't running during a standalone app, so raw evdev isn't an
++ * option anyway; this shared segment is what's actually populated. */
++#ifndef SF3000_JOYKEY_H
++#define SF3000_JOYKEY_H
++
++enum {
++    JK_LEFT, JK_RIGHT, JK_UP, JK_DOWN,
++    JK_A, JK_B, JK_L1, JK_R1, JK_X, JK_Y,
++    JK_START, JK_SELECT, JK_COUNT
++};
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Attaches the shared memory segment. Safe to call once at startup; silently
++ * leaves the reader inert (always returns 0) if unavailable. */
++void joykey_init(void);
++
++/* Current button state, one bit per JK_* enum value (1 = held). */
++unsigned int joykey_read(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff -ruN -x 'build-*' -x '*.before-pacing' sdl-pristine/SDL2-2.0.14/src/events/sf3500/SDL_sf3500input.c SDL2-2.0.14/src/events/sf3500/SDL_sf3500input.c
+--- a/src/events/sf3500/SDL_sf3500input.c	1969-12-31 18:00:00.000000000 -0600
++++ b/src/events/sf3500/SDL_sf3500input.c	2026-10-11 05:36:36.149849100 -0500
+@@ -0,0 +1,68 @@
++#include "../../SDL_internal.h"
++
++#if SDL_AUDIO_DRIVER_HWAUDIO /* this build is SF3500-specific either way */
++
++#include "SDL_sf3500input.h"
++#include "../SDL_keyboard_c.h"
++#include "joykey.h"
++#ifndef _WIN32
++#include <unistd.h>
++#include <stdio.h>
++#endif
++
++/* Mapping taken directly from the staged PortMaster package's own
++ * sorr.gptk control file (back=esc, start=enter, a=v, b=c, x=x, y=a,
++ * l1=b, r1=d, arrows=arrows) - this device's joykey.h enum has no
++ * L2/R2/L3/R3/analog bits (no physical buttons for them), so those
++ * gptk entries are irrelevant here; everything joykey.h DOES expose
++ * is covered below. */
++static const SDL_Scancode jk_scancode[JK_COUNT] = {
++    SDL_SCANCODE_LEFT,    /* JK_LEFT */
++    SDL_SCANCODE_RIGHT,   /* JK_RIGHT */
++    SDL_SCANCODE_UP,      /* JK_UP */
++    SDL_SCANCODE_DOWN,    /* JK_DOWN */
++    SDL_SCANCODE_V,       /* JK_A  (a = v) */
++    SDL_SCANCODE_C,       /* JK_B  (b = c) */
++    SDL_SCANCODE_B,       /* JK_L1 (l1 = b) */
++    SDL_SCANCODE_D,       /* JK_R1 (r1 = d) */
++    SDL_SCANCODE_X,       /* JK_X  (x = x) */
++    SDL_SCANCODE_A,       /* JK_Y  (y = a) */
++    SDL_SCANCODE_RETURN,  /* JK_START  (start = enter) */
++    SDL_SCANCODE_ESCAPE   /* JK_SELECT (back = esc) */
++};
++
++unsigned int
++SF3500_PumpJoykeyKeyboard(void)
++{
++    static int initialized = 0;
++    unsigned int bits;
++    int i;
++
++    if (!initialized) {
++        joykey_init();
++        initialized = 1;
++#ifndef _WIN32
++        {
++            /* One-time only (gated by `initialized`) - intentional, keep it.
++             * A per-frame "bits=0x%x" trace used to live right after
++             * joykey_read() below; it caused a real, measured stutter
++             * (write() syscall on every frame any button was held) and was
++             * removed. Do not add a per-call debug write in this function
++             * again without throttling it (once/sec, like
++             * libsdlhandler.c's dump_new_events() does) - see
++             * sorr-vita/CHANGELOG.md item 2 and 6. */
++            const char *msg = "SF3500_PumpJoykeyKeyboard: first call, joykey_init done\n";
++            write(2, msg, SDL_strlen(msg));
++        }
++#endif
++    }
++
++    bits = joykey_read();
++    for (i = 0; i < JK_COUNT; i++) {
++        SDL_SendKeyboardKey((bits & (1u << i)) ? SDL_PRESSED : SDL_RELEASED, jk_scancode[i]);
++    }
++    return bits;
++}
++
++#endif /* SDL_AUDIO_DRIVER_HWAUDIO */
++/* vi: set ts=4 sw=4 expandtab: */
+diff -ruN -x 'build-*' -x '*.before-pacing' sdl-pristine/SDL2-2.0.14/src/events/sf3500/SDL_sf3500input.h SDL2-2.0.14/src/events/sf3500/SDL_sf3500input.h
+--- a/src/events/sf3500/SDL_sf3500input.h	1969-12-31 18:00:00.000000000 -0600
++++ b/src/events/sf3500/SDL_sf3500input.h	2026-10-10 22:28:36.911215900 -0500
+@@ -0,0 +1,34 @@
++/* SF3500 synthetic-keyboard input bridge.
++ *
++ * SORR (BennuGD/libkey.c) reads input via SDL_GetKeyboardState(), which
++ * only reflects reality when something calls SDL_SendKeyboardKey() - which
++ * normally happens inside a real video backend's own event pump (X11,
++ * Windows' WndProc, etc). This device's VIDEO_DUMMY driver never does
++ * that, and there is no real keyboard anyway - input is the joykey.c
++ * shared-memory gamepad. This bridges the two: call
++ * SF3500_PumpJoykeyKeyboard() once per frame (from libsdlhandler's
++ * existing per-frame hook) and it calls SDL_SendKeyboardKey() for the
++ * scancodes SORR's own sorr.gptk control mapping expects, so libkey.c
++ * needs zero changes - same "thin adapter, patch nothing downstream"
++ * shape as the hwaudio SDL2 driver. See sorr_handoff project memory. */
++#include "../../SDL_internal.h"
++
++#ifndef SDL_sf3500input_h_
++#define SDL_sf3500input_h_
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Returns the raw joykey_read() bitmask for this frame, so the caller can
++ * also check for the standing SF3500 exit combo (SELECT+START) without a
++ * second joykey_read() call - see sf3500_port_pipeline_recipe project
++ * memory: never trust a game's own in-built quit path on this device. */
++unsigned int SF3500_PumpJoykeyKeyboard(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
++/* vi: set ts=4 sw=4 expandtab: */
