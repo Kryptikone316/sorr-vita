@@ -53,12 +53,66 @@
  * in between (SDL_mixer here, same as C-Dogs), tapping the ALREADY-
  * MIXED buffer via Mix_SetPostMix() instead. See sorr_handoff project
  * memory. */
+/* SF3500: rate the mixer runs at. SoRR's own music is 44100 Hz, so running
+ * the mixer at that rate means SDL_mixer never converts the music (it used to
+ * resample every music stream to 48000 Hz in real time with a windowed-sinc
+ * filter, which cost enough CPU to cause constant underruns unless the player
+ * re-encoded all of the music first). The mixed output is converted to the
+ * hardware's fixed 48000 Hz below with a cheap linear interpolation instead.
+ * SF3500_MIX_RATE=48000 selects the old behaviour (for music that has already
+ * been re-encoded to 48000 Hz). */
+static int sf3500_mix_rate = 44100;
+
+static short *rs_buf = NULL;
+static int rs_cap = 0;
+static unsigned long long rs_pos = 0;   /* 32.32 fixed point, see below */
+static short rs_prev[2] = { 0, 0 };
+
+/* Linear-interpolating resampler from sf3500_mix_rate to HWAUDIO_RATE.
+ * Position is kept in a virtual array v where v[0] is the last frame of the
+ * previous block and v[k] is frame k-1 of this one, so the output is
+ * continuous across calls. */
+static void SF3500_ResampleWrite( const short * in, int n )
+{
+    const unsigned long long step =
+        ( (unsigned long long) sf3500_mix_rate << 32 ) / HWAUDIO_RATE;
+    int maxout = (int)( ( (unsigned long long) n << 32 ) / step ) + 2;
+    int out = 0;
+
+    if ( maxout > rs_cap )
+    {
+        short * nb = (short *) realloc( rs_buf, (size_t) maxout * 2 * sizeof( short ) );
+        if ( !nb ) return;
+        rs_buf = nb;
+        rs_cap = maxout;
+    }
+
+    while ( ( rs_pos >> 32 ) < (unsigned long long) n && out < rs_cap )
+    {
+        int i = (int)( rs_pos >> 32 );
+        int f = (int)( ( rs_pos >> 16 ) & 0xFFFF );
+        const short * a = i == 0 ? rs_prev : in + ( i - 1 ) * 2;
+        const short * b = in + i * 2;
+        rs_buf[out * 2]     = (short)( a[0] + ( ( (long long)( b[0] - a[0] ) * f ) >> 16 ) );
+        rs_buf[out * 2 + 1] = (short)( a[1] + ( ( (long long)( b[1] - a[1] ) * f ) >> 16 ) );
+        rs_pos += step;
+        out++;
+    }
+    rs_pos -= (unsigned long long) n << 32;
+    rs_prev[0] = in[( n - 1 ) * 2];
+    rs_prev[1] = in[( n - 1 ) * 2 + 1];
+
+    hwaudio_write( rs_buf, out );
+}
+
 static void SF3500_AudioPostMix( void * udata, Uint8 * stream, int len )
 {
     (void) udata;
-    /* Opened at exactly HWAUDIO_RATE/stereo/S16 below - no resampling
-     * needed, same as C-Dogs' own comment on this exact line. */
-    hwaudio_write( (const short *) stream, len / 4 );
+    /* Opened at sf3500_mix_rate/stereo/S16 below. */
+    if ( sf3500_mix_rate == HWAUDIO_RATE )
+        hwaudio_write( (const short *) stream, len / 4 );
+    else if ( len >= 4 )
+        SF3500_ResampleWrite( (const short *) stream, len / 4 );
 
     /* SF3500: real-time-producer diagnostic - buffer-size tuning in both
      * directions made the reported crackle/stutter WORSE, not better
@@ -245,7 +299,11 @@ static int sound_init()
          * needs cross-rate conversion against what hwaudio_write()
          * expects. The script's own SOUND_FREQ preference is no longer
          * read - this device only has the one real rate anyway. */
-        audio_rate = HWAUDIO_RATE;
+        {
+            const char * mr = getenv( "SF3500_MIX_RATE" );
+            if ( mr && atoi( mr ) == HWAUDIO_RATE ) sf3500_mix_rate = HWAUDIO_RATE;
+        }
+        audio_rate = sf3500_mix_rate;
 
 #ifdef TARGET_WII
         /* WII uses a powerpc architecture, which is big-endian */
